@@ -168,6 +168,12 @@ if uploaded_file:
         st.subheader("📋 Résultats détaillés par PMC")
         st.dataframe(df_result)
 
+        # ➕ Poids total & pièces total
+        st.markdown("#### 🧾 Totaux globaux")
+        poids_total = df_result["Poids brut (kg)"].str.replace(",", ".").astype(float).sum()
+        total_pieces = df_result["Total Pièces"].astype(int).sum()
+        st.markdown(f"**Poids total :** {poids_total:.1f} kg  \n**Total pièces :** {total_pieces}")
+
         pdf_bytes = generate_pdf(df_result)
         st.download_button(
             label="📄 Télécharger en PDF",
