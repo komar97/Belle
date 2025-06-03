@@ -5,7 +5,6 @@ import tempfile
 import re
 import io
 import os
-from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
@@ -18,6 +17,7 @@ Dépose ton fichier manifest (PDF) : le script extrait automatiquement :
 - Infos vol + PMC
 - Total pièces + détail par AWB (n°, pièces, poids)
 - 📄 Export PDF, 📊 Stats PMC
+
 ✍️ Colle ici une liste de PMC à extraire si tu veux en filtrer certains.
 """)
 
@@ -26,6 +26,15 @@ uploaded_file = st.file_uploader("📤 Dépose ton fichier PDF ici :", type="pdf
 st.markdown("**Colle ici les PMC à extraire (un par ligne) :**")
 pmc_filter_text = st.text_area("PMC à extraire", height=150)
 filtered_pmcs = [line.strip() for line in pmc_filter_text.splitlines() if line.strip()]
+
+# Expression stricte : préfixes + suite alphanumérique OU "BULK"
+PMC_PATTERN = re.compile(
+    r"^(" +
+    r"BULK" +
+    r"|" +
+    r"(?:PMC|PEB|PGE|PGA|PRA|PAG|PUB|PLA|MPC|QKE|AKE|PYB|PIP|PAJ|HMJ)[A-Z0-9]+" +
+    r")$"
+)
 
 def extract_manifest_with_pcs_awb(pdf_path):
     doc = fitz.open(pdf_path)
@@ -62,7 +71,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
         while i < len(lines):
             line = lines[i].strip()
 
-            if line.startswith(("PMC", "AKE", "BULK", "PGE")):
+            if PMC_PATTERN.match(line):
                 if current_pmc:
                     total_weight = sum(weights) if weights else 0
                     total_pcs = sum(pcs_list) if pcs_list else 0
@@ -84,7 +93,6 @@ def extract_manifest_with_pcs_awb(pdf_path):
                 i += 1
                 continue
 
-            # Format classique : AWB + PCS + poids sur 3 lignes
             if re.match(r'^\d{3}-\d{8}$', line) and i + 2 < len(lines):
                 awb = line.strip()
                 pcs_line = lines[i + 1].strip()
@@ -101,7 +109,6 @@ def extract_manifest_with_pcs_awb(pdf_path):
                 except:
                     pass
 
-            # Nouveau format condensé : AWB PCS WEIGHT (sur une seule ligne)
             match_inline = re.match(r'^(\d{3}-\d{8})\s+(\d+)(?:/\d+)?\s+([\d.,]+)', line)
             if match_inline:
                 try:
@@ -118,7 +125,6 @@ def extract_manifest_with_pcs_awb(pdf_path):
 
             i += 1
 
-    # Ajout du dernier PMC, même incomplet
     if current_pmc:
         total_weight = sum(weights) if weights else 0
         total_pcs = sum(pcs_list) if pcs_list else 0
@@ -138,13 +144,18 @@ def extract_manifest_with_pcs_awb(pdf_path):
         "Point of Loading", "Flight No", "PMC No", "Poids brut (kg)",
         "Total Pièces", "Liste des AWB", "Pièces par AWB", "Poids par AWB", "Nombre AWB"
     ])
+    df = df.sort_values("Total Pièces").reset_index(drop=True)
     return df
 
 def generate_pdf(dataframe):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
-    data = [list(dataframe.columns)] + dataframe.astype(str).values.tolist()
+
+    # Supprimer colonnes spécifiques pour le PDF
+    df_pdf = dataframe.drop(columns=["Point of Loading", "Flight No", "Nombre AWB"])
+
+    data = [list(df_pdf.columns)] + df_pdf.astype(str).values.tolist()
     table = Table(data, repeatRows=1)
     style = TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -184,6 +195,12 @@ if uploaded_file:
     with col1:
         st.subheader("📋 Résultats détaillés par PMC")
         st.dataframe(df_result)
+
+        total_pcs = df_result["Total Pièces"].astype(int).sum()
+        total_kg = df_result["Poids brut (kg)"].str.replace(",", ".").astype(float).sum()
+
+        st.markdown(f"**🧮 Total pièces : {total_pcs}**")
+        st.markdown(f"**⚖️ Poids total (kg) : {total_kg:,.1f}**".replace(",", " ").replace(".", ","))
 
         pdf_bytes = generate_pdf(df_result)
         st.download_button(
