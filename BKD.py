@@ -18,7 +18,6 @@ Dépose ton fichier manifest (PDF) : le script extrait automatiquement :
 - Infos vol + PMC
 - Total pièces + détail par AWB (n°, pièces, poids)
 - 📄 Export PDF, 📊 Stats PMC
-
 ✍️ Colle ici une liste de PMC à extraire si tu veux en filtrer certains.
 """)
 
@@ -51,7 +50,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
     pcs_list = []
     awb_list = []
 
-    for page in doc:
+    for page in doc[:min(50, len(doc))]:
         blocks = page.get_text("blocks")
         lines = []
         for block in blocks:
@@ -64,9 +63,9 @@ def extract_manifest_with_pcs_awb(pdf_path):
             line = lines[i].strip()
 
             if line.startswith(("PMC", "AKE", "BULK", "PGE")):
-                if current_pmc and weights:
-                    total_weight = sum(weights)
-                    total_pcs = sum(pcs_list)
+                if current_pmc:
+                    total_weight = sum(weights) if weights else 0
+                    total_pcs = sum(pcs_list) if pcs_list else 0
                     data.append([
                         point_of_loading,
                         flight_no,
@@ -85,6 +84,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
                 i += 1
                 continue
 
+            # Format classique : AWB + PCS + poids sur 3 lignes
             if re.match(r'^\d{3}-\d{8}$', line) and i + 2 < len(lines):
                 awb = line.strip()
                 pcs_line = lines[i + 1].strip()
@@ -100,11 +100,28 @@ def extract_manifest_with_pcs_awb(pdf_path):
                     continue
                 except:
                     pass
+
+            # Nouveau format condensé : AWB PCS WEIGHT (sur une seule ligne)
+            match_inline = re.match(r'^(\d{3}-\d{8})\s+(\d+)(?:/\d+)?\s+([\d.,]+)', line)
+            if match_inline:
+                try:
+                    awb = match_inline.group(1)
+                    pcs_val = int(match_inline.group(2))
+                    weight_val = float(match_inline.group(3).replace(",", ""))
+                    awb_list.append(awb)
+                    pcs_list.append(pcs_val)
+                    weights.append(weight_val)
+                    i += 1
+                    continue
+                except:
+                    pass
+
             i += 1
 
-    if current_pmc and weights:
-        total_weight = sum(weights)
-        total_pcs = sum(pcs_list)
+    # Ajout du dernier PMC, même incomplet
+    if current_pmc:
+        total_weight = sum(weights) if weights else 0
+        total_pcs = sum(pcs_list) if pcs_list else 0
         data.append([
             point_of_loading,
             flight_no,
@@ -167,12 +184,6 @@ if uploaded_file:
     with col1:
         st.subheader("📋 Résultats détaillés par PMC")
         st.dataframe(df_result)
-
-        # ➕ Poids total & pièces total
-        st.markdown("#### 🧾 Totaux globaux")
-        poids_total = df_result["Poids brut (kg)"].str.replace(",", ".").astype(float).sum()
-        total_pieces = df_result["Total Pièces"].astype(int).sum()
-        st.markdown(f"**Poids total :** {poids_total:.1f} kg  \n**Total pièces :** {total_pieces}")
 
         pdf_bytes = generate_pdf(df_result)
         st.download_button(
