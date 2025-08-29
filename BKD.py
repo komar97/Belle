@@ -148,13 +148,72 @@ def extract_manifest_with_pcs_awb(pdf_path):
     return df
 
 def generate_pdf(dataframe):
+    # 1) Calculer le total de pièces par AWB sur tout le fichier
+    awb_totals = {}
+    for _, row in dataframe.iterrows():
+        awb_list = str(row.get("Liste des AWB", "") or "").split("\n")
+        pcs_list = str(row.get("Pièces par AWB", "") or "").split("\n")
+        for awb, pcs in zip(awb_list, pcs_list):
+            awb = awb.strip()
+            if not awb:
+                continue
+            try:
+                pcs_val = int(str(pcs).strip().split("/")[0])
+            except:
+                pcs_val = 0
+            awb_totals[awb] = awb_totals.get(awb, 0) + pcs_val
+
+    # 2) Préparer le DataFrame pour l’export PDF (sans modifier l’original)
+    df_pdf = dataframe.copy()
+
+    # a) Ajouter "Localisation" vide juste après "Liste des AWB"
+    if "Liste des AWB" in df_pdf.columns:
+        insert_idx = list(df_pdf.columns).index("Liste des AWB") + 1
+    else:
+        insert_idx = len(df_pdf.columns)
+    df_pdf.insert(insert_idx, "Localisation", "")
+
+    # b) Ajouter "Total AWB" (somme globale des pièces par AWB, alignée ligne à ligne)
+    def _row_total_awb_strings(row):
+        awbs = str(row.get("Liste des AWB", "") or "").split("\n")
+        totals = []
+        for a in awbs:
+            a = a.strip()
+            if not a:
+                continue
+            totals.append(str(awb_totals.get(a, 0)))
+        return "\n".join(totals)
+
+    if "Pièces par AWB" in df_pdf.columns:
+        insert_idx2 = list(df_pdf.columns).index("Pièces par AWB") + 1
+    else:
+        insert_idx2 = len(df_pdf.columns)
+    df_pdf.insert(insert_idx2, "Total AWB", df_pdf.apply(_row_total_awb_strings, axis=1))
+
+    # c) Supprimer colonnes non souhaitées dans le PDF (dont "Poids brut (kg)")
+    drop_cols = [c for c in ["Point of Loading", "Flight No", "Nombre AWB", "Poids brut (kg)"] if c in df_pdf.columns]
+    df_pdf = df_pdf.drop(columns=drop_cols)
+
+    # d) Ordonner colonnes avec "Total Pièces" à la fin,
+    #    et "Total AWB" juste après "Pièces par AWB", "Localisation" après "Liste des AWB"
+    cols = list(df_pdf.columns)
+    desired_prefix = [c for c in ["PMC No", "Liste des AWB", "Localisation", "Pièces par AWB", "Total AWB", "Poids par AWB"] if c in cols]
+    others = [c for c in cols if c not in desired_prefix + ["Total Pièces"]]
+    tail = ["Total Pièces"] if "Total Pièces" in cols else []
+    new_order = desired_prefix + others + tail
+    df_pdf = df_pdf[new_order]
+
+    # 3) Génération du PDF
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
 
+<<<<<<< HEAD
+=======
     # Supprimer colonnes spécifiques pour le PDF
     df_pdf = dataframe.drop(columns=["Point of Loading", "Flight No", "Nombre AWB"])
 
+>>>>>>> 47f84a4e2ec78d92c2d3feb2bb4b9c99a86bd6ab
     data = [list(df_pdf.columns)] + df_pdf.astype(str).values.tolist()
     table = Table(data, repeatRows=1)
     style = TableStyle([
@@ -174,6 +233,7 @@ def generate_pdf(dataframe):
         bg_color = colors.HexColor("#C0C0C0") if row % 2 == 0 else colors.white
         style.add("BACKGROUND", (0, row), (-1, row), bg_color)
     table.setStyle(style)
+
     doc.build([table])
     pdf = buffer.getvalue()
     buffer.close()
