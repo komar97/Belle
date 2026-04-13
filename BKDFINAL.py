@@ -9,9 +9,7 @@ import streamlit.components.v1 as components
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle
-)
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
 # =========================
 #         UI
@@ -30,7 +28,7 @@ uploaded_file = st.file_uploader("📤 Dépose ton fichier PDF ici :", type="pdf
 
 st.markdown("**Colle ici les PMC à extraire (un par ligne) :**")
 pmc_filter_text = st.text_area("PMC à extraire", height=150)
-filtered_pmcs = [line.strip() for line in pmc_filter_text.splitlines() if line.strip()]
+filtered_pmcs = [line.strip().upper() for line in pmc_filter_text.splitlines() if line.strip()]
 
 # =========================
 #     Constantes / Regex
@@ -52,20 +50,63 @@ HEADER_EXCLUDE = re.compile(
     r"(Flight No\./Date|Point of Loading|Arr\. Date|Import Check Manifest|\*[A-Z0-9\-]+)"
 )
 
+AWB_ONLY_PATTERN = re.compile(r"^\d{3}-\d{8}$")
+AWB_INLINE_PATTERN = re.compile(r"^(\d{3}-\d{8})\s+(\d+)(?:/\d+)?\s+([\d.,]+)")
+
+# =========================
+#     Helpers fichiers
+# =========================
+def uploaded_file_to_bytes(uploaded_file):
+    """
+    Récupère les bytes du PDF uploadé de façon fiable sur Streamlit Cloud.
+    """
+    if uploaded_file is None:
+        return b""
+
+    file_bytes = uploaded_file.getvalue()
+    if not file_bytes:
+        return b""
+
+    return file_bytes
+
+
+def bytes_to_temp_pdf(file_bytes):
+    """
+    Écrit les bytes dans un fichier temporaire .pdf et renvoie son chemin.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    try:
+        tmp.write(file_bytes)
+        tmp.flush()
+        return tmp.name
+    finally:
+        tmp.close()
+
+
+def safe_remove_file(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 # =========================
 #   Extraction principale
 # =========================
 def extract_manifest_with_pcs_awb(pdf_path):
     doc = fitz.open(pdf_path)
+
     lines_preview = []
     for i in range(min(3, len(doc))):
         lines_preview.extend(doc[i].get_text().splitlines())
 
     point_of_loading = "UNKNOWN"
     flight_no = "UNKNOWN"
+
     for i, line in enumerate(lines_preview):
         if "Point of Loading:" in line and i - 1 >= 0:
             point_of_loading = lines_preview[i - 1].strip()
+
         if "Flight No./Date:" in line and i - 1 >= 0:
             flight_line = lines_preview[i - 1].strip()
             match = re.match(r"^([A-Z0-9]+)", flight_line)
@@ -106,6 +147,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
                         "\n".join(f"{w:.1f}".replace(".", ",") for w in weights),
                         len(awb_list)
                     ])
+
                 current_pmc = token
                 weights = []
                 pcs_list = []
@@ -113,22 +155,23 @@ def extract_manifest_with_pcs_awb(pdf_path):
                 i += 1
                 continue
 
-            if re.match(r'^\d{3}-\d{8}$', line) and i + 2 < len(lines):
+            if AWB_ONLY_PATTERN.match(line) and i + 2 < len(lines):
                 awb = line.strip()
                 pcs_line = (lines[i + 1] or "").strip()
                 weight_line = (lines[i + 2] or "").strip()
+
                 try:
-                    pcs_val = int(pcs_line.split('/')[0])
+                    pcs_val = int(pcs_line.split("/")[0])
                     weight_val = float(weight_line.replace(",", ""))
                     awb_list.append(awb)
                     pcs_list.append(pcs_val)
                     weights.append(weight_val)
                     i += 3
                     continue
-                except:
+                except Exception:
                     pass
 
-            match_inline = re.match(r'^(\d{3}-\d{8})\s+(\d+)(?:/\d+)?\s+([\d.,]+)', line)
+            match_inline = AWB_INLINE_PATTERN.match(line)
             if match_inline:
                 try:
                     awb = match_inline.group(1)
@@ -139,7 +182,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
                     weights.append(weight_val)
                     i += 1
                     continue
-                except:
+                except Exception:
                     pass
 
             i += 1
@@ -159,11 +202,16 @@ def extract_manifest_with_pcs_awb(pdf_path):
             len(awb_list)
         ])
 
+    doc.close()
+
     df = pd.DataFrame(data, columns=[
         "Point of Loading", "Flight No", "PMC No", "Poids brut (kg)",
         "Total Pièces", "Liste des AWB", "Pièces par AWB", "Poids par AWB", "Nombre AWB"
     ])
-    df = df.sort_values("Total Pièces").reset_index(drop=True)
+
+    if not df.empty:
+        df = df.sort_values("Total Pièces").reset_index(drop=True)
+
     return df
 
 # =========================
@@ -172,6 +220,7 @@ def extract_manifest_with_pcs_awb(pdf_path):
 def _collect_pdf_lines(pdf_path):
     doc = fitz.open(pdf_path)
     pages_lines = []
+
     for page in doc:
         blocks = page.get_text("blocks")
         lines = []
@@ -180,15 +229,17 @@ def _collect_pdf_lines(pdf_path):
             if txt:
                 lines.extend(txt.splitlines())
         pages_lines.append(lines)
+
+    doc.close()
     return pages_lines
+
 
 def build_awb_destination_map(pdf_path):
     """
     Associe chaque AWB au code destination (DST, 3 lettres) :
-    1) Cherche ORG-DST sur la même ligne (priorité à la partie après l'AWB),
-    2) Sinon scanne 3 lignes suivantes (en ignorant les en-têtes),
-    3) Sinon 2 lignes précédentes (en ignorant les en-têtes).
-    Renvoie uniquement le DST (2e code).
+    1) Cherche ORG-DST sur la même ligne
+    2) Sinon scanne 3 lignes suivantes
+    3) Sinon 2 lignes précédentes
     """
     pages_lines = _collect_pdf_lines(pdf_path)
     awb_dest = {}
@@ -240,13 +291,6 @@ def build_awb_destination_map(pdf_path):
 #   PDF Résumé PMC uniquement
 # =========================
 def generate_summary_pdf(dataframe, source_pdf_path):
-    """
-    Construit un PDF contenant UNIQUEMENT le résumé PMC :
-    - tableau zébré
-    - colonne Localisation vide
-    - colonne Destination
-    - colonne Total AWB
-    """
     awb_totals = {}
     for _, row in dataframe.iterrows():
         awb_list = str(row.get("Liste des AWB", "") or "").split("\n")
@@ -257,7 +301,7 @@ def generate_summary_pdf(dataframe, source_pdf_path):
                 continue
             try:
                 pcs_val = int(str(pcs).strip().split("/")[0])
-            except:
+            except Exception:
                 pcs_val = 0
             awb_totals[awb] = awb_totals.get(awb, 0) + pcs_val
 
@@ -291,7 +335,10 @@ def generate_summary_pdf(dataframe, source_pdf_path):
     if "Destination" in df_pdf.columns:
         df_pdf["Destination"] = df_pdf.apply(_row_destinations, axis=1)
 
-    drop_cols = [c for c in ["Point of Loading", "Flight No", "Nombre AWB", "Poids brut (kg)"] if c in df_pdf.columns]
+    drop_cols = [
+        c for c in ["Point of Loading", "Flight No", "Nombre AWB", "Poids brut (kg)"]
+        if c in df_pdf.columns
+    ]
     df_pdf = df_pdf.drop(columns=drop_cols)
 
     cols = list(df_pdf.columns)
@@ -335,8 +382,8 @@ def generate_summary_pdf(dataframe, source_pdf_path):
     table.setStyle(table_style)
 
     story.append(table)
-
     doc.build(story)
+
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
@@ -345,11 +392,14 @@ def generate_summary_pdf(dataframe, source_pdf_path):
 #   Helper texte résumé PMC
 # =========================
 def build_pmc_bulk_summary_line(dataframe):
+    if dataframe.empty:
+        return "0 PMC (0 PCS)"
+
     pmc_values = dataframe["PMC No"].astype(str).str.strip().tolist()
 
     has_bulk = any(val.upper() == "BULK" for val in pmc_values)
     pmc_count = sum(1 for val in pmc_values if val.upper() != "BULK")
-    total_pcs = dataframe["Total Pièces"].astype(int).sum()
+    total_pcs = pd.to_numeric(dataframe["Total Pièces"], errors="coerce").fillna(0).astype(int).sum()
 
     if has_bulk:
         return f"{pmc_count} PMC + BULK ({total_pcs} PCS)"
@@ -408,62 +458,91 @@ def render_copy_button_left(text_to_copy):
 # =========================
 #        App logic
 # =========================
-if uploaded_file:
-    file_name = os.path.splitext(uploaded_file.name)[0]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        source_pdf_path = tmp_file.name
+if uploaded_file is not None:
+    source_pdf_path = None
+
+    try:
+        file_bytes = uploaded_file_to_bytes(uploaded_file)
+
+        if not file_bytes:
+            st.error("Le fichier uploadé est vide ou n'a pas pu être lu.")
+            st.stop()
+
+        file_name = os.path.splitext(uploaded_file.name)[0]
+        source_pdf_path = bytes_to_temp_pdf(file_bytes)
+
+        if not os.path.exists(source_pdf_path) or os.path.getsize(source_pdf_path) == 0:
+            st.error("Le PDF temporaire n'a pas été créé correctement.")
+            st.stop()
+
         df_result = extract_manifest_with_pcs_awb(source_pdf_path)
 
-    if filtered_pmcs:
-        df_result = df_result[df_result["PMC No"].isin(filtered_pmcs)]
+        if filtered_pmcs:
+            df_result = df_result[df_result["PMC No"].astype(str).str.upper().isin(filtered_pmcs)]
 
-    st.success("✅ Extraction terminée avec succès !")
+        if df_result.empty:
+            st.warning("Aucun résultat trouvé dans ce PDF.")
+            st.stop()
 
-    col1, col2 = st.columns([2, 1])
+        st.success("✅ Extraction terminée avec succès !")
 
-    with col1:
-        st.subheader("📋 Résultats détaillés par PMC")
-        st.dataframe(df_result)
+        col1, col2 = st.columns([2, 1])
 
-        total_pcs = df_result["Total Pièces"].astype(int).sum()
-        total_kg = df_result["Poids brut (kg)"].str.replace(",", ".").astype(float).sum()
+        with col1:
+            st.subheader("📋 Résultats détaillés par PMC")
+            st.dataframe(df_result, use_container_width=True)
 
-        st.markdown(f"**🧮 Total pièces : {total_pcs}**")
-        st.markdown(f"**⚖️ Poids total (kg) : {total_kg:,.1f}**".replace(",", " ").replace(".", ","))
+            total_pcs = pd.to_numeric(df_result["Total Pièces"], errors="coerce").fillna(0).astype(int).sum()
+            total_kg = (
+                df_result["Poids brut (kg)"]
+                .astype(str)
+                .str.replace(",", ".", regex=False)
+                .pipe(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .sum()
+            )
 
-        summary_line = build_pmc_bulk_summary_line(df_result)
-        render_copy_button_left(summary_line)
+            st.markdown(f"**🧮 Total pièces : {total_pcs}**")
+            st.markdown(f"**⚖️ Poids total (kg) : {total_kg:,.1f}**".replace(",", " ").replace(".", ","))
 
-        summary_pdf_bytes = generate_summary_pdf(df_result, source_pdf_path)
-        st.download_button(
-            "📄 Télécharger le PDF résumé",
-            data=summary_pdf_bytes,
-            file_name=f"{file_name}+RESUME.pdf",
-            mime="application/pdf"
-        )
+            summary_line = build_pmc_bulk_summary_line(df_result)
+            render_copy_button_left(summary_line)
 
-    with col2:
-        st.subheader("📊 Statistiques sur les pièces par PMC")
+            summary_pdf_bytes = generate_summary_pdf(df_result, source_pdf_path)
+            st.download_button(
+                "📄 Télécharger le PDF résumé",
+                data=summary_pdf_bytes,
+                file_name=f"{file_name}+RESUME.pdf",
+                mime="application/pdf"
+            )
 
-        bin_ranges = {
-            "< 50": (0, 49),
-            "50 - 99": (50, 99),
-            "100 - 149": (100, 149),
-            "150 - 199": (150, 199),
-            "200 - 249": (200, 249),
-            "≥ 250": (250, float("inf"))
-        }
+        with col2:
+            st.subheader("📊 Statistiques sur les pièces par PMC")
 
-        stats = {label: 0 for label in bin_ranges}
-        for pcs in df_result["Total Pièces"].astype(int):
-            for label, (low, high) in bin_ranges.items():
-                if low <= pcs <= high:
-                    stats[label] += 1
-                    break
+            bin_ranges = {
+                "< 50": (0, 49),
+                "50 - 99": (50, 99),
+                "100 - 149": (100, 149),
+                "150 - 199": (150, 199),
+                "200 - 249": (200, 249),
+                "≥ 250": (250, float("inf"))
+            }
 
-        df_stats = pd.DataFrame(list(stats.items()), columns=["Tranche de pièces", "Nombre de PMC"])
-        total_pmc = int(df_result.shape[0])
-        df_stats.loc[len(df_stats)] = ["Total", total_pmc]
+            stats = {label: 0 for label in bin_ranges}
+            for pcs in pd.to_numeric(df_result["Total Pièces"], errors="coerce").fillna(0).astype(int):
+                for label, (low, high) in bin_ranges.items():
+                    if low <= pcs <= high:
+                        stats[label] += 1
+                        break
 
-        st.table(df_stats)
+            df_stats = pd.DataFrame(list(stats.items()), columns=["Tranche de pièces", "Nombre de PMC"])
+            total_pmc = int(df_result.shape[0])
+            df_stats.loc[len(df_stats)] = ["Total", total_pmc]
+
+            st.table(df_stats)
+
+    except Exception as e:
+        st.error(f"Erreur pendant le traitement : {e}")
+
+    finally:
+        safe_remove_file(source_pdf_path)
